@@ -10,6 +10,7 @@ import { Order, OrderSchema } from '../orders/schemas/order.schema';
 import { RealtimeGateway } from './realtime.gateway';
 import { ClientEvent, ServerEvent } from './realtime.events';
 import { RealtimeService } from './realtime.service';
+import { TrackingTokensService } from '../tracking/tracking-tokens.service';
 import { WsAuthService } from './ws-auth.service';
 
 const SECRET = 'test-secret';
@@ -22,7 +23,7 @@ describe('Realtime gateway (no DB)', () => {
   let realtime: RealtimeService;
   const sockets: Socket[] = [];
   const ids = { kitchen: new Types.ObjectId().toHexString(), rider: new Types.ObjectId().toHexString(), rider2: new Types.ObjectId().toHexString(), custA: new Types.ObjectId().toHexString(), custB: new Types.ObjectId().toHexString() };
-  let stored: { _id: string; customerId: string; riderId?: string }[] = [];
+  let stored: { _id: string; customerId: string; riderId?: string; status: string; fulfillment: string }[] = [];
 
   const tok = (sub: string, role: Role, expiresIn: number | string = '1h') => jwt.sign({ sub, role }, { expiresIn: expiresIn as never });
   const connect = (token?: string): Promise<Socket> =>
@@ -43,7 +44,7 @@ describe('Realtime gateway (no DB)', () => {
 
   const makeOrder = (customerId: string, riderId?: string, status = OrderStatus.Placed) => {
     const _id = new Types.ObjectId();
-    stored.push({ _id: _id.toHexString(), customerId, riderId });
+    stored.push({ _id: _id.toHexString(), customerId, riderId, status, fulfillment: 'delivery' });
     return new OrderModel({
       _id, orderNumber: 'SR-TEST22', customerId: new Types.ObjectId(customerId), status, paymentStatus: PaymentStatus.CodPending, paymentMethod: 'cod',
       lines: [{ menuItemId: new Types.ObjectId(), name: 'Wrap', isVeg: true, unitPricePaise: 14900, options: [], quantity: 1, lineTotalPaise: 14900 }],
@@ -56,11 +57,20 @@ describe('Realtime gateway (no DB)', () => {
   beforeAll(async () => {
     const fakeModel = {
       exists: async (f: any) =>
-        stored.find((o) => o._id === String(f._id) && (!f.customerId || String(f.customerId) === o.customerId) && (!f.riderId || String(f.riderId) === o.riderId)) ? { _id: f._id } : null,
+        stored.find(
+          (o) =>
+            o._id === String(f._id) &&
+            (!f.customerId || String(f.customerId) === o.customerId) &&
+            (!f.riderId || String(f.riderId) === o.riderId) &&
+            (!f.status || f.status.$in.includes(o.status)) &&
+            (!f.fulfillment || f.fulfillment === o.fulfillment),
+        )
+          ? { _id: f._id }
+          : null,
     };
     const mod = await Test.createTestingModule({
       imports: [ConfigModule.forRoot({ ignoreEnvFile: true }), JwtModule.register({ secret: SECRET })],
-      providers: [RealtimeGateway, RealtimeService, WsAuthService, { provide: getModelToken(Order.name), useValue: fakeModel }],
+      providers: [RealtimeGateway, RealtimeService, WsAuthService, { provide: TrackingTokensService, useValue: { authorizeTracking: async () => ({ ok: false, code: 'invalid' }) } }, { provide: getModelToken(Order.name), useValue: fakeModel }],
     }).compile();
     app = mod.createNestApplication();
     await app.listen(0, '127.0.0.1');
@@ -151,6 +161,106 @@ describe('Realtime gateway (no DB)', () => {
     const closed = new Promise<void>((r) => s.on('disconnect', () => r()));
     await Promise.all([expired, closed]);
   }, 5000);
+
+  describe('live rider location', () => {
+    const fix = (orderId: string, over: Record<string, unknown> = {}) => ({ orderId, latitude: 11.8745, longitude: 75.3704, heading: 90, accuracy: 12, timestamp: Date.now(), ...over });
+    const setStatus = (id: string, status: OrderStatus) => { const o = stored.find((x) => x._id === id)!; o.status = status; };
+
+    it('rider -> customer: validated position reaches only the owning customer, with the full event', async () => {
+      const order = makeOrder(ids.custA, ids.rider, OrderStatus.OutForDelivery);
+      const rider = await connect(tok(ids.rider, Role.Rider));
+      const custA = await connect(tok(ids.custA, Role.Customer));
+      const custB = await connect(tok(ids.custB, Role.Customer));
+      expect(await emitAck(custA, ClientEvent.JoinOrder, { orderId: order.id })).toEqual({ ok: true });
+      expect(await emitAck(custB, ClientEvent.JoinOrder, { orderId: order.id })).toEqual({ ok: false, error: 'not_found' });
+      const [a, b, r] = [custA, custB, rider].map((s) => collect(s, ServerEvent.RiderLocation));
+
+      const sent = fix(order.id);
+      expect(await emitAck(rider, ClientEvent.RiderLocation, sent)).toEqual({ ok: true });
+      await waitFor(a); await tick();
+      expect(a).toHaveLength(1);
+      expect(a[0]).toEqual({ orderId: order.id, latitude: 11.8745, longitude: 75.3704, heading: 90, accuracy: 12, timestamp: sent.timestamp });
+      expect(b).toHaveLength(0);
+      expect(r).toHaveLength(0); // the rider is not echoed their own position
+    });
+
+    it('only a rider socket may send; customers and kitchen get forbidden', async () => {
+      const order = makeOrder(ids.custA, ids.rider, OrderStatus.OutForDelivery);
+      for (const [id, role] of [[ids.custA, Role.Customer], [ids.kitchen, Role.Kitchen], [ids.kitchen, Role.Admin]] as const) {
+        const s = await connect(tok(id, role));
+        expect(await emitAck(s, ClientEvent.RiderLocation, fix(order.id))).toEqual({ ok: false, error: 'forbidden' });
+      }
+    });
+
+    it("rejects another rider's order and any order that is not in a trackable status", async () => {
+      const mine = makeOrder(ids.custA, ids.rider, OrderStatus.OutForDelivery);
+      const rider2 = await connect(tok(ids.rider2, Role.Rider));
+      expect(await emitAck(rider2, ClientEvent.RiderLocation, fix(mine.id))).toEqual({ ok: false, error: 'not_active' });
+      expect(await emitAck(rider2, ClientEvent.RiderLocation, fix(new Types.ObjectId().toHexString()))).toEqual({ ok: false, error: 'not_active' });
+
+      const rider = await connect(tok(ids.rider, Role.Rider));
+      for (const st of [OrderStatus.Assigned, OrderStatus.Delivered, OrderStatus.Cancelled, OrderStatus.Ready]) {
+        setStatus(mine.id, st);
+        expect(await emitAck(rider, ClientEvent.RiderLocation, fix(mine.id))).toEqual({ ok: false, error: 'not_active' });
+      }
+      for (const st of [OrderStatus.RiderAccepted, OrderStatus.PickedUp, OrderStatus.OutForDelivery]) {
+        setStatus(mine.id, st);
+        const fresh = await connect(tok(ids.rider, Role.Rider));
+        expect(await emitAck(fresh, ClientEvent.RiderLocation, fix(mine.id))).toEqual({ ok: true });
+      }
+    });
+
+    it('drops malformed payloads', async () => {
+      const order = makeOrder(ids.custA, ids.rider, OrderStatus.OutForDelivery);
+      const rider = await connect(tok(ids.rider, Role.Rider));
+      const bad = [null, 'x', {}, fix(order.id, { latitude: 91 }), fix(order.id, { longitude: 'a' }), fix(order.id, { accuracy: -1 }), fix(order.id, { timestamp: Date.now() + 10 * 60_000 }), fix('nope')];
+      for (const b of bad) expect(await emitAck(rider, ClientEvent.RiderLocation, b)).toEqual({ ok: false, error: 'invalid_payload' });
+    });
+
+    it('throttles a flooding client per order, then lets the next update through', async () => {
+      const order = makeOrder(ids.custA, ids.rider, OrderStatus.OutForDelivery);
+      const cust = await connect(tok(ids.custA, Role.Customer));
+      await emitAck(cust, ClientEvent.JoinOrder, { orderId: order.id });
+      const got = collect(cust, ServerEvent.RiderLocation);
+      const rider = await connect(tok(ids.rider, Role.Rider));
+      expect(await emitAck(rider, ClientEvent.RiderLocation, fix(order.id))).toEqual({ ok: true });
+      expect(await emitAck(rider, ClientEvent.RiderLocation, fix(order.id))).toEqual({ ok: false, error: 'rate_limited' });
+      await tick(2100);
+      expect(await emitAck(rider, ClientEvent.RiderLocation, fix(order.id))).toEqual({ ok: true });
+      await waitFor(got, 2);
+      expect(got).toHaveLength(2);
+    }, 8000);
+
+    it('a customer who joins late immediately gets the last known position; none after the order closes', async () => {
+      const order = makeOrder(ids.custA, ids.rider, OrderStatus.OutForDelivery);
+      const rider = await connect(tok(ids.rider, Role.Rider));
+      await emitAck(rider, ClientEvent.RiderLocation, fix(order.id, { latitude: 11.9 }));
+
+      const late = await connect(tok(ids.custA, Role.Customer));
+      const got = collect(late, ServerEvent.RiderLocation);
+      await emitAck(late, ClientEvent.JoinOrder, { orderId: order.id });
+      await waitFor(got); await tick();
+      expect(got).toHaveLength(1);
+      expect(got[0]).toMatchObject({ orderId: order.id, latitude: 11.9 });
+
+      order.status = OrderStatus.Delivered;
+      realtime.publishOrderStatusChanged(order, OrderStatus.OutForDelivery);
+      const later = await connect(tok(ids.custA, Role.Customer));
+      const none = collect(later, ServerEvent.RiderLocation);
+      await emitAck(later, ClientEvent.JoinOrder, { orderId: order.id });
+      await tick();
+      expect(none).toHaveLength(0);
+    });
+
+    it('never moves the rider backwards in time (out-of-order packet)', () => {
+      const svc = new RealtimeService();
+      const id = new Types.ObjectId().toHexString();
+      const ev = (timestamp: number, latitude: number) => ({ orderId: id, latitude, longitude: 75, heading: null, accuracy: 5, timestamp });
+      svc.publishRiderLocation(ev(2000, 11.2));
+      svc.publishRiderLocation(ev(1000, 11.1));
+      expect(svc.getLastLocation(id)?.latitude).toBe(11.2);
+    });
+  });
 
   it('publish is a safe no-op / never throws', () => {
     expect(() => new RealtimeService().publishOrderCreated(makeOrder(ids.custA))).not.toThrow();

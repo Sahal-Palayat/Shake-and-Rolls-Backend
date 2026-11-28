@@ -10,8 +10,12 @@ const LEGAL: [S, S][] = [
   [S.Accepted, S.Cancelled],
   [S.Preparing, S.Ready],
   [S.Ready, S.Assigned],
-  [S.Assigned, S.PickedUp],
-  [S.PickedUp, S.Delivered],
+  [S.Assigned, S.RiderAccepted],
+  [S.Assigned, S.PickedUp], // skipping "accepted" stays legal
+  [S.RiderAccepted, S.PickedUp],
+  [S.PickedUp, S.OutForDelivery],
+  [S.PickedUp, S.Delivered], // skipping "out for delivery" stays legal
+  [S.OutForDelivery, S.Delivered],
 ];
 
 describe('order state machine', () => {
@@ -31,7 +35,7 @@ describe('order state machine', () => {
   });
 
   it('cancel/reject only from early states', () => {
-    for (const s of [S.Preparing, S.Ready, S.Assigned, S.PickedUp, S.Delivered]) {
+    for (const s of [S.Preparing, S.Ready, S.Assigned, S.RiderAccepted, S.PickedUp, S.OutForDelivery, S.Delivered]) {
       expect(isLegalTransition(s, S.Cancelled)).toBe(false);
       expect(isLegalTransition(s, S.Rejected)).toBe(false);
     }
@@ -46,5 +50,19 @@ describe('order state machine', () => {
     expect(canRoleTransition(S.Assigned, S.PickedUp, Role.Rider)).toBe(true);
     expect(canRoleTransition(S.Assigned, S.PickedUp, Role.Kitchen)).toBe(false);
     expect(canRoleTransition(S.PickedUp, S.Delivered, Role.Customer)).toBe(false);
+  });
+
+  it('the rider checkpoints belong to the rider (and admin), nobody else', () => {
+    for (const [a, b] of [[S.Assigned, S.RiderAccepted], [S.RiderAccepted, S.PickedUp], [S.PickedUp, S.OutForDelivery], [S.OutForDelivery, S.Delivered]] as [S, S][]) {
+      expect(canRoleTransition(a, b, Role.Rider)).toBe(true);
+      expect(canRoleTransition(a, b, Role.Admin)).toBe(true);
+      expect(canRoleTransition(a, b, Role.Kitchen)).toBe(false);
+      expect(canRoleTransition(a, b, Role.Customer)).toBe(false);
+    }
+  });
+
+  it('no way back: a rider cannot undo a checkpoint', () => {
+    expect(isLegalTransition(S.RiderAccepted, S.Assigned)).toBe(false);
+    expect(isLegalTransition(S.OutForDelivery, S.PickedUp)).toBe(false);
   });
 });

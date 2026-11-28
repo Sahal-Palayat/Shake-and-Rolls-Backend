@@ -24,8 +24,23 @@ export class OrderLine {
   @Prop({ required: true, min: 1, validate: isInt }) quantity!: number;
   @Prop({ required: true, min: 0, validate: isInt }) lineTotalPaise!: number; // (base + options) * quantity
   @Prop({ trim: true }) note?: string;
+  @Prop() comboRef?: string; // groups the lines of one combo
+  @Prop() comboName?: string; // snapshot
 }
 const OrderLineSchema = SchemaFactory.createForClass(OrderLine);
+
+/** Snapshot of a combo discount. Combo edits/deletes never change a placed order. */
+@Schema({ _id: false })
+export class AppliedCombo {
+  @Prop({ type: Types.ObjectId, required: true }) comboId!: Types.ObjectId;
+  @Prop({ required: true }) comboRef!: string;
+  @Prop({ required: true }) name!: string;
+  @Prop({ required: true, min: 0, max: 90, validate: isInt }) discountPercent!: number;
+  @Prop({ required: true, min: 1, validate: isInt }) quantity!: number;
+  @Prop({ required: true, min: 0, validate: isInt }) itemsPaise!: number;
+  @Prop({ required: true, min: 0, validate: isInt }) savingsPaise!: number;
+}
+const AppliedComboSchema = SchemaFactory.createForClass(AppliedCombo);
 
 @Schema({ _id: false })
 export class StatusLogEntry {
@@ -38,8 +53,32 @@ export class StatusLogEntry {
 }
 const StatusLogEntrySchema = SchemaFactory.createForClass(StatusLogEntry);
 
+/** GeoJSON point. NOTE: coordinates are [longitude, latitude] (GeoJSON order), the reverse of how people say it. */
+@Schema({ _id: false })
+export class GeoPoint {
+  @Prop({ type: String, enum: ['Point'], required: true, default: 'Point' }) type!: 'Point';
+  @Prop({
+    type: [Number],
+    required: true,
+    validate: {
+      validator: (c: number[]) => Array.isArray(c) && c.length === 2 && c[0] >= -180 && c[0] <= 180 && c[1] >= -90 && c[1] <= 90,
+      message: 'coordinates must be [lng, lat]',
+    },
+  })
+  coordinates!: number[];
+}
+const GeoPointSchema = SchemaFactory.createForClass(GeoPoint);
+
 @Schema({ _id: false })
 export class DeliveryAddress {
+  /** The exact GPS point to deliver to. Primary; the text fields below only describe it. Absent on older orders. */
+  @Prop({ type: GeoPointSchema }) location?: GeoPoint;
+  @Prop({ type: String, enum: ['gps', 'search', 'pin'] }) locationSource?: 'gps' | 'search' | 'pin';
+  @Prop({ trim: true }) placeId?: string;
+  @Prop({ trim: true }) formattedAddress?: string;
+  @Prop({ trim: true }) houseName?: string;
+  @Prop({ trim: true }) buildingName?: string;
+  @Prop({ trim: true }) floor?: string;
   @Prop({ required: true, trim: true }) line1!: string;
   @Prop({ trim: true }) area?: string;
   @Prop({ trim: true }) landmark?: string;
@@ -61,7 +100,10 @@ export class Order {
   @Prop({ type: [OrderLineSchema], required: true }) lines!: OrderLine[];
   @Prop({ type: String, enum: Object.values(Fulfillment), required: true, default: Fulfillment.Delivery })
   fulfillment!: Fulfillment;
+  /** Items after combo savings. */
   @Prop({ required: true, min: 0, validate: isInt, default: 0 }) subtotalPaise!: number;
+  @Prop({ required: true, min: 0, validate: isInt, default: 0 }) comboSavingsPaise!: number;
+  @Prop({ type: [AppliedComboSchema], default: [] }) combos!: AppliedCombo[];
   @Prop({ required: true, min: 0, validate: isInt, default: 0 }) deliveryFeePaise!: number;
   @Prop({ required: true, min: 0, validate: isInt }) totalPaise!: number;
 
@@ -89,3 +131,4 @@ export const OrderSchema = SchemaFactory.createForClass(Order);
 OrderSchema.index({ customerId: 1, idempotencyKey: 1 }, { unique: true });
 OrderSchema.index({ customerId: 1, createdAt: -1 });
 OrderSchema.index({ riderId: 1, status: 1 });
+OrderSchema.index({ 'deliveryAddress.location': '2dsphere' }); // sparse by default: pickup and older orders have no point

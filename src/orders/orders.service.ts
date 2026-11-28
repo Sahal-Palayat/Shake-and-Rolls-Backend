@@ -3,6 +3,7 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
   OnApplicationBootstrap,
   UnprocessableEntityException,
@@ -12,17 +13,24 @@ import { InjectModel } from '@nestjs/mongoose';
 import { createHash, randomInt } from 'crypto';
 import { Model, Types } from 'mongoose';
 import { Fulfillment, OrderStatus, PaymentStatus, Role } from '../common/enums';
+import { CombosService } from '../combos/combos.service';
+import { ComboDocument } from '../combos/schemas/combo.schema';
 import { MenuService } from '../menu/menu.service';
 import { MenuItemDocument } from '../menu/schemas/menu-item.schema';
 import { RealtimeService } from '../realtime/realtime.service';
+import { AccessTokenKind, RevokeReason } from '../tracking/tracking.constants';
+import { TrackingLinkDto, TrackingRevokeResultDto } from '../tracking/dto/tracking.dto';
+import { TrackingTokensService } from '../tracking/tracking-tokens.service';
 import { UsersService } from '../users/users.service';
 import { AuthUser } from './current-user.decorator';
 import { CreateOrderDto, ListOrdersQueryDto, OrderQuoteDto, OverrideOrderStatusDto, QuoteOrderDto, UpdateOrderStatusDto } from './dto/order.dto';
 import { deliveryFeeFor, FeeConfig, loadFeeConfig } from './fees';
 import { checkCashCollected, formatRupees } from './cash';
+import { checkDeliveryArea, DeliveryArea, formatKm, loadDeliveryArea } from './delivery-area';
 import { canRoleTransition, isLegalTransition } from './order-state-machine';
 import { orderScope } from './order-scope';
 import { DEFAULT_MAX_COD_PAISE } from './orders.constants';
+import { applyCombos } from './combo-pricing';
 import { priceLines } from './pricing';
 import { Order, OrderDocument, StatusLogEntry } from './schemas/order.schema';
 
@@ -49,6 +57,9 @@ function normalizePhone(p: string): string {
   return p.startsWith('+91') ? p : `+91${p}`;
 }
 
+/** 6 decimals is about 0.1 m: more than a phone can resolve, and keeps the stored point and the idempotency hash stable. */
+const roundCoord = (n: number): number => Math.round(n * 1e6) / 1e6;
+
 /** Canonical fingerprint of what the client asked for (never of server-computed prices). */
 function fingerprint(dto: CreateOrderDto, phone: string): string {
   const canon = {
@@ -57,6 +68,8 @@ function fingerprint(dto: CreateOrderDto, phone: string): string {
       q: l.quantity,
       o: [...(l.optionIds ?? [])].sort(),
       n: l.note?.trim() || null,
+      c: l.comboId ?? null,
+      r: l.comboRef ?? null,
     })),
     pm: dto.paymentMethod,
     f: dto.fulfillment ?? Fulfillment.Delivery,
@@ -70,6 +83,14 @@ function fingerprint(dto: CreateOrderDto, phone: string): string {
             ar: dto.deliveryAddress.area?.trim() || null,
             lm: dto.deliveryAddress.landmark?.trim() || null,
             pc: dto.deliveryAddress.pincode ?? null,
+            la: roundCoord(dto.deliveryAddress.latitude),
+            ln: roundCoord(dto.deliveryAddress.longitude),
+            src: dto.deliveryAddress.locationSource ?? null,
+            pid: dto.deliveryAddress.placeId ?? null,
+            fa: dto.deliveryAddress.formattedAddress?.trim() || null,
+            hn: dto.deliveryAddress.houseName?.trim() || null,
+            bn: dto.deliveryAddress.buildingName?.trim() || null,
+            fl: dto.deliveryAddress.floor?.trim() || null,
           },
     cnote: dto.customerNote?.trim() || null,
   };
@@ -78,12 +99,16 @@ function fingerprint(dto: CreateOrderDto, phone: string): string {
 
 @Injectable()
 export class OrdersService implements OnApplicationBootstrap {
+  private readonly log = new Logger(OrdersService.name);
+
   constructor(
     @InjectModel(Order.name) private readonly orders: Model<OrderDocument>,
     private readonly menu: MenuService,
     private readonly config: ConfigService,
     private readonly realtime: RealtimeService,
     private readonly users: UsersService,
+    private readonly tracking: TrackingTokensService,
+    private readonly combos: CombosService,
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
@@ -100,6 +125,22 @@ export class OrdersService implements OnApplicationBootstrap {
     });
   }
 
+  /** undefined = no area configured, so no restriction (production refuses to boot like that: see config/env.ts). */
+  deliveryArea(): DeliveryArea | undefined {
+    return loadDeliveryArea((k) => this.config.get<unknown>(k));
+  }
+
+  /** The GPS point is the source of truth. Throws 422 when it is outside the area. */
+  private assertInDeliveryArea(latitude: number, longitude: number): void {
+    const area = this.deliveryArea();
+    if (!area) return;
+    const r = checkDeliveryArea({ lat: latitude, lng: longitude }, area);
+    if (r.ok) return;
+    if (r.reason === 'invalid') throw new BadRequestException('Delivery location is not a valid GPS point');
+    const reach = area.polygon ? '' : ` We deliver within ${formatKm(area.radiusMeters)} of the shop.`;
+    throw new UnprocessableEntityException(`That location is outside our delivery area (${formatKm(r.distanceMeters)} from the shop).${reach} Move the pin closer, or choose pickup.`);
+  }
+
   private maxCodPaise(): number {
     return Number(this.config.get<number | string>('MAX_COD_PAISE') ?? DEFAULT_MAX_COD_PAISE);
   }
@@ -108,11 +149,26 @@ export class OrdersService implements OnApplicationBootstrap {
     const ids = [...new Set(dto.lines.map((l) => l.menuItemId))];
     const found = await this.menu.findItemsByIds(ids);
     const menu = new Map<string, MenuItemDocument>(found.map((i) => [i.id as string, i]));
-    const { lines, totalPaise: subtotalPaise } = priceLines(dto.lines, menu);
+    const priced = priceLines(dto.lines, menu);
+    const comboIds = [...new Set(dto.lines.flatMap((l) => (l.comboId ? [l.comboId] : [])))];
+    const comboDocs = comboIds.length ? await this.combos.findByIds(comboIds) : [];
+    const combos = new Map<string, ComboDocument>(comboDocs.map((c) => [c.id as string, c]));
+    const withCombos = applyCombos(dto.lines, priced.lines, menu, combos);
+    // Subtotal is what the customer pays for items, so min-order and free-delivery go by the discounted amount.
+    const subtotalPaise = priced.totalPaise - withCombos.savingsPaise;
     const fulfillment = dto.fulfillment ?? Fulfillment.Delivery;
     const fees = this.feeConfig();
     const deliveryFeePaise = deliveryFeeFor(fulfillment, subtotalPaise, fees);
-    return { lines, fulfillment, fees, subtotalPaise, deliveryFeePaise, totalPaise: subtotalPaise + deliveryFeePaise };
+    return {
+      lines: withCombos.lines,
+      combos: withCombos.combos,
+      comboSavingsPaise: withCombos.savingsPaise,
+      fulfillment,
+      fees,
+      subtotalPaise,
+      deliveryFeePaise,
+      totalPaise: subtotalPaise + deliveryFeePaise,
+    };
   }
 
   /** Prices a cart exactly as create() would. Writes nothing. Same errors as create() for unknown/unavailable items. */
@@ -133,9 +189,12 @@ export class OrdersService implements OnApplicationBootstrap {
         quantity: l.quantity,
         lineTotalPaise: l.lineTotalPaise,
         ...(l.note ? { note: l.note } : {}),
+        ...(l.comboRef ? { comboRef: l.comboRef, comboName: l.comboName } : {}),
       })),
       fulfillment: p.fulfillment,
       subtotalPaise: p.subtotalPaise,
+      comboSavingsPaise: p.comboSavingsPaise,
+      combos: p.combos.map((c) => ({ ...c, comboId: String(c.comboId) })),
       deliveryFeePaise: p.deliveryFeePaise,
       totalPaise: p.totalPaise,
       minOrderPaise: p.fees.minOrderPaise,
@@ -158,9 +217,10 @@ export class OrdersService implements OnApplicationBootstrap {
     const existing = await this.orders.findOne({ customerId, idempotencyKey });
     if (existing) return { order: this.assertSameRequest(existing, requestHash), replayed: true };
 
-    const { lines, fulfillment, fees, subtotalPaise, deliveryFeePaise, totalPaise } = await this.priceCart(dto);
+    const { lines, combos, comboSavingsPaise, fulfillment, fees, subtotalPaise, deliveryFeePaise, totalPaise } = await this.priceCart(dto);
     const isPickup = fulfillment === Fulfillment.Pickup;
     if (!isPickup && !dto.deliveryAddress) throw new BadRequestException('deliveryAddress is required for delivery');
+    if (!isPickup && dto.deliveryAddress) this.assertInDeliveryArea(dto.deliveryAddress.latitude, dto.deliveryAddress.longitude);
 
     if (fees.minOrderPaise > 0 && subtotalPaise < fees.minOrderPaise) {
       throw new UnprocessableEntityException(`Minimum order is ₹${fees.minOrderPaise / 100}. Add more items.`);
@@ -181,6 +241,8 @@ export class OrdersService implements OnApplicationBootstrap {
           fulfillment,
           lines,
           subtotalPaise,
+          comboSavingsPaise,
+          combos,
           deliveryFeePaise,
           totalPaise,
           contactName: dto.contactName.trim(),
@@ -189,6 +251,13 @@ export class OrdersService implements OnApplicationBootstrap {
             ? {}
             : {
                 deliveryAddress: {
+                  location: { type: 'Point', coordinates: [roundCoord(dto.deliveryAddress.longitude), roundCoord(dto.deliveryAddress.latitude)] },
+                  locationSource: dto.deliveryAddress.locationSource,
+                  placeId: dto.deliveryAddress.placeId,
+                  formattedAddress: dto.deliveryAddress.formattedAddress?.trim(),
+                  houseName: dto.deliveryAddress.houseName?.trim(),
+                  buildingName: dto.deliveryAddress.buildingName?.trim(),
+                  floor: dto.deliveryAddress.floor?.trim(),
                   line1: dto.deliveryAddress.line1.trim(),
                   area: dto.deliveryAddress.area?.trim(),
                   landmark: dto.deliveryAddress.landmark?.trim(),
@@ -307,6 +376,7 @@ export class OrdersService implements OnApplicationBootstrap {
     );
     if (!updated) throw new ConflictException('Order was changed by someone else. Reload and retry.');
     this.realtime.publishOrderStatusChanged(updated, from);
+    await this.closeTrackingIfOver(updated);
     return updated;
   }
 
@@ -318,7 +388,7 @@ export class OrdersService implements OnApplicationBootstrap {
     const to = dto.status;
     if (from === to) throw new ConflictException(`Order is already ${to}`);
 
-    const needsRider = to === OrderStatus.Assigned || to === OrderStatus.PickedUp || to === OrderStatus.Delivered;
+    const needsRider = [OrderStatus.Assigned, OrderStatus.RiderAccepted, OrderStatus.PickedUp, OrderStatus.OutForDelivery, OrderStatus.Delivered].includes(to);
     const existingRider = order.riderId?.toHexString();
     const set: Record<string, unknown> = { status: to };
     const unset: Record<string, 1> = {};
@@ -350,7 +420,51 @@ export class OrdersService implements OnApplicationBootstrap {
     );
     if (!updated) throw new ConflictException('Order was changed by someone else. Reload and retry.');
     this.realtime.publishOrderStatusChanged(updated, from);
+    await this.closeTrackingIfOver(updated);
     return updated;
+  }
+
+  // ---------- customer tracking link ----------
+
+  /**
+   * Generates a new 24 h tracking link for a delivery order. The raw token is in the answer ONCE (only its hash is stored).
+   * Visibility rules are the usual ones: a rider can only do this for their own order.
+   */
+  async createTrackingLink(user: AuthUser, id: string): Promise<TrackingLinkDto> {
+    const order = await this.getVisible(user, id);
+    if (order.fulfillment !== Fulfillment.Delivery) throw new BadRequestException('Tracking links are only for delivery orders');
+    if (order.status === OrderStatus.Cancelled || order.status === OrderStatus.Rejected) {
+      throw new ConflictException('This order was cancelled, so it has nothing to track');
+    }
+    const { token, expiresAt } = await this.tracking.issueTrackingLink(id, user.id);
+    return { url: this.tracking.urlFor(token), expiresAt: expiresAt.toISOString() };
+  }
+
+  /**
+   * Security invalidation: switches off every tracking link of the order and drops the open tracking pages.
+   * The review route is switched off too (a leaked link must not keep any door open).
+   */
+  async revokeTrackingLinks(user: AuthUser, id: string): Promise<TrackingRevokeResultDto> {
+    await this.getVisible(user, id);
+    const revoked = await this.tracking.revokeAllForOrder(id, RevokeReason.Security, [AccessTokenKind.Tracking, AccessTokenKind.Review]);
+    this.realtime.publishTrackingRevoked(id);
+    return { revoked };
+  }
+
+  /**
+   * Cancelled / rejected: nothing left to track. Revokes the links and closes the open pages. Never fails the status
+   * change itself: if this write fails, tracking is still denied because every check also looks at the order's status
+   * (TrackingTokensService.authorizeTracking).
+   */
+  private async closeTrackingIfOver(order: OrderDocument): Promise<void> {
+    if (order.status !== OrderStatus.Cancelled && order.status !== OrderStatus.Rejected) return;
+    const reason = order.status === OrderStatus.Cancelled ? RevokeReason.Cancelled : RevokeReason.Rejected;
+    try {
+      await this.tracking.revokeAllForOrder(order.id as string, reason, [AccessTokenKind.Tracking, AccessTokenKind.Review]);
+    } catch (e) {
+      this.log.error(`could not revoke tracking links for ${order.orderNumber}: ${(e as Error).message}`);
+    }
+    this.realtime.publishTrackingRevoked(order.id as string);
   }
 
   private async assertActiveRider(riderId: string): Promise<void> {

@@ -26,13 +26,15 @@ function setup(env: Record<string, number> = {}, order: Record<string, unknown> 
   };
   const menu: any = { findItemsByIds: async () => [] };
   const config: any = { get: (k: string) => env[k] };
-  const realtime: any = { publishOrderCreated: jest.fn(), publishOrderStatusChanged: jest.fn() };
+  const realtime: any = { publishOrderCreated: jest.fn(), publishOrderStatusChanged: jest.fn(), publishTrackingRevoked: jest.fn() };
   const users: any = { findActiveById: async () => null };
-  return { svc: new OrdersService(model, menu, config, realtime, users), created, calls, realtime };
+  const tracking: any = { revokeAllForOrder: jest.fn().mockResolvedValue(0), issueTrackingLink: jest.fn(), urlFor: (t: string) => `https://shop.test/track/${t}` };
+  return { svc: new OrdersService(model, menu, config, realtime, users, tracking), created, calls, realtime, tracking };
 }
 
 const lineIn = { menuItemId: oid().toHexString(), quantity: 1 };
-const addr = { line1: '12 Main Rd' };
+const SHOP = { lat: 11.8745, lng: 75.3704 };
+const addr = { line1: '12 Main Rd', latitude: SHOP.lat, longitude: SHOP.lng };
 const base = { lines: [lineIn], paymentMethod: 'cod' as const, contactName: 'Asha', contactPhone: '9876500000' };
 
 beforeEach(() => (priceLines as jest.Mock).mockReset());
@@ -69,7 +71,7 @@ describe('create', () => {
     (priceLines as jest.Mock).mockReturnValue(priced(20000));
     const { svc, created, realtime } = setup({ DELIVERY_FEE_PAISE: 3000 });
     await svc.create(customer, 'key-12345678', { ...base, deliveryAddress: addr });
-    expect(created[0]).toMatchObject({ fulfillment: 'delivery', subtotalPaise: 20000, deliveryFeePaise: 3000, totalPaise: 23000, deliveryAddress: { line1: '12 Main Rd' } });
+    expect(created[0]).toMatchObject({ fulfillment: 'delivery', subtotalPaise: 20000, deliveryFeePaise: 3000, totalPaise: 23000, deliveryAddress: { line1: '12 Main Rd', location: { type: 'Point', coordinates: [SHOP.lng, SHOP.lat] } } });
     expect(realtime.publishOrderCreated).toHaveBeenCalled();
   });
 
@@ -100,6 +102,49 @@ describe('create', () => {
     const { svc } = setup({ MAX_COD_PAISE: 200000, DELIVERY_FEE_PAISE: 3000 });
     await expect(svc.create(customer, 'key-12345678', { ...base, deliveryAddress: addr })).rejects.toBeInstanceOf(UnprocessableEntityException);
     await expect(svc.create(customer, 'key-12345678', { ...base, fulfillment: Fulfillment.Pickup })).resolves.toBeDefined();
+  });
+});
+
+describe('create: delivery area (GPS is the source of truth)', () => {
+  const AREA = { RESTAURANT_LAT: SHOP.lat, RESTAURANT_LNG: SHOP.lng, DELIVERY_RADIUS_METERS: 5000 };
+  const at = (latitude: number, longitude: number) => ({ ...base, deliveryAddress: { ...addr, latitude, longitude } });
+
+  it('accepts a pin inside the radius and stores [lng, lat] plus the door details', async () => {
+    (priceLines as jest.Mock).mockReturnValue(priced(20000));
+    const { svc, created } = setup(AREA);
+    await svc.create(customer, 'key-12345678', { ...at(SHOP.lat + 0.01, SHOP.lng), deliveryAddress: { ...addr, latitude: SHOP.lat + 0.01, longitude: SHOP.lng, houseName: ' Rose Villa ', buildingName: 'Sea View', floor: '3', formattedAddress: '12 Main Rd, Kannur', locationSource: 'pin' } });
+    expect(created[0].deliveryAddress).toMatchObject({
+      location: { type: 'Point', coordinates: [SHOP.lng, SHOP.lat + 0.01] },
+      houseName: 'Rose Villa',
+      buildingName: 'Sea View',
+      floor: '3',
+      formattedAddress: '12 Main Rd, Kannur',
+      locationSource: 'pin',
+    });
+  });
+
+  it('rejects a pin outside the radius, even though the address text says it is local', async () => {
+    (priceLines as jest.Mock).mockReturnValue(priced(20000));
+    const { svc, created } = setup(AREA);
+    await expect(svc.create(customer, 'key-12345678', at(SHOP.lat + 0.2, SHOP.lng))).rejects.toThrow(/outside our delivery area/);
+    expect(created).toHaveLength(0);
+  });
+
+  it('pickup is never area-checked', async () => {
+    (priceLines as jest.Mock).mockReturnValue(priced(20000));
+    const { svc } = setup(AREA);
+    await expect(svc.create(customer, 'key-12345678', { ...base, fulfillment: Fulfillment.Pickup })).resolves.toBeDefined();
+  });
+
+  it('no area configured = no restriction', async () => {
+    (priceLines as jest.Mock).mockReturnValue(priced(20000));
+    const { svc } = setup({});
+    await expect(svc.create(customer, 'key-12345678', at(28.6, 77.2))).resolves.toBeDefined();
+  });
+
+  it('exposes the area for the checkout map', () => {
+    expect(setup({}).svc.deliveryArea()).toBeUndefined();
+    expect(setup(AREA).svc.deliveryArea()).toEqual({ center: SHOP, radiusMeters: 5000 });
   });
 });
 
@@ -137,5 +182,45 @@ describe('transition: pickup handover', () => {
   it('old orders with no fulfillment field behave as delivery', async () => {
     const { svc } = setup({}, { status: OrderStatus.Ready, paymentMethod: 'cod', paymentStatus: PaymentStatus.CodPending });
     await expect(svc.transition(kitchen, 'o1', { status: OrderStatus.Delivered })).rejects.toThrow(/Illegal transition/);
+  });
+});
+
+describe('transition: rider checkpoints (accepted, picked up, out for delivery)', () => {
+  const onRoad = (status: OrderStatus) => ({ status, fulfillment: 'delivery', paymentMethod: 'cod', paymentStatus: PaymentStatus.CodPending, totalPaise: 23000 });
+
+  it.each([
+    [OrderStatus.Assigned, OrderStatus.RiderAccepted],
+    [OrderStatus.RiderAccepted, OrderStatus.PickedUp],
+    [OrderStatus.PickedUp, OrderStatus.OutForDelivery],
+    [OrderStatus.Assigned, OrderStatus.PickedUp], // skipping stays legal
+  ])('rider: %s -> %s needs no cash', async (from, to) => {
+    const { svc, calls } = setup({}, onRoad(from));
+    const o = await svc.transition(rider, 'o1', { status: to });
+    expect(o.status).toBe(to);
+    expect(calls[0].update.$set.cashCollectedPaise).toBeUndefined();
+  });
+
+  it('cash is only asked at the last step: out_for_delivery -> delivered', async () => {
+    const a = setup({}, onRoad(OrderStatus.OutForDelivery));
+    await expect(a.svc.transition(rider, 'o1', { status: OrderStatus.Delivered })).rejects.toBeInstanceOf(BadRequestException);
+    const b = setup({}, onRoad(OrderStatus.OutForDelivery));
+    await b.svc.transition(rider, 'o1', { status: OrderStatus.Delivered, cashCollectedPaise: 23000 });
+    expect(b.calls[0].update.$set).toMatchObject({ status: OrderStatus.Delivered, paymentStatus: PaymentStatus.CodCollected, cashCollectedPaise: 23000 });
+  });
+
+  it('only the rider (or admin) moves these: the kitchen cannot accept for the rider', async () => {
+    const { svc } = setup({}, onRoad(OrderStatus.Assigned));
+    await expect(svc.transition(kitchen, 'o1', { status: OrderStatus.RiderAccepted })).rejects.toBeInstanceOf(ForbiddenException);
+  });
+
+  it('no going back', async () => {
+    const { svc } = setup({}, onRoad(OrderStatus.OutForDelivery));
+    await expect(svc.transition(rider, 'o1', { status: OrderStatus.PickedUp })).rejects.toThrow(/Illegal transition/);
+  });
+
+  it('every checkpoint is written to the status log with the rider as actor', async () => {
+    const { svc, calls } = setup({}, onRoad(OrderStatus.Assigned));
+    await svc.transition(rider, 'o1', { status: OrderStatus.RiderAccepted });
+    expect(calls[0].update.$push.statusLog).toMatchObject({ from: OrderStatus.Assigned, to: OrderStatus.RiderAccepted, byRole: Role.Rider });
   });
 });

@@ -1,15 +1,18 @@
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
+import { CombosModule } from '../combos/combos.module';
 import { MenuModule } from '../menu/menu.module';
 import { UsersModule } from '../users/users.module';
 import { RealtimeModule } from '../realtime/realtime.module';
+import { TrackingModule } from '../tracking/tracking.module';
+import { DeliveryController } from './delivery.controller';
 import { OrdersController } from './orders.controller';
 import { OrdersService } from './orders.service';
 import { Order, OrderSchema } from './schemas/order.schema';
 
 @Module({
-  imports: [MongooseModule.forFeature([{ name: Order.name, schema: OrderSchema }]), MenuModule, RealtimeModule, UsersModule],
-  controllers: [OrdersController],
+  imports: [MongooseModule.forFeature([{ name: Order.name, schema: OrderSchema }]), MenuModule, CombosModule, RealtimeModule, UsersModule, TrackingModule],
+  controllers: [OrdersController, DeliveryController],
   providers: [OrdersService],
   exports: [OrdersService], // payments (online) will build on this
 })

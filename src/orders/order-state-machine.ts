@@ -8,6 +8,7 @@ import { OrderStatus, Role } from '../common/enums';
 type Rule = { to: OrderStatus; roles: readonly Role[] };
 
 const STAFF = [Role.Kitchen, Role.Admin] as const;
+const RIDER = [Role.Rider, Role.Admin] as const;
 
 const RULES: Record<OrderStatus, readonly Rule[]> = {
   [OrderStatus.Placed]: [
@@ -21,8 +22,19 @@ const RULES: Record<OrderStatus, readonly Rule[]> = {
   ],
   [OrderStatus.Preparing]: [{ to: OrderStatus.Ready, roles: STAFF }],
   [OrderStatus.Ready]: [{ to: OrderStatus.Assigned, roles: STAFF }],
-  [OrderStatus.Assigned]: [{ to: OrderStatus.PickedUp, roles: [Role.Rider, Role.Admin] }],
-  [OrderStatus.PickedUp]: [{ to: OrderStatus.Delivered, roles: [Role.Rider, Role.Admin] }],
+  // Rider leg: assigned -> accepted -> picked up -> out for delivery -> delivered.
+  // "Accepted" and "out for delivery" are the rider's own checkpoints; skipping them stays legal so a
+  // rider on a bad connection (or the kitchen / admin hand-over) is never stuck.
+  [OrderStatus.Assigned]: [
+    { to: OrderStatus.RiderAccepted, roles: RIDER },
+    { to: OrderStatus.PickedUp, roles: RIDER },
+  ],
+  [OrderStatus.RiderAccepted]: [{ to: OrderStatus.PickedUp, roles: RIDER }],
+  [OrderStatus.PickedUp]: [
+    { to: OrderStatus.OutForDelivery, roles: RIDER },
+    { to: OrderStatus.Delivered, roles: RIDER },
+  ],
+  [OrderStatus.OutForDelivery]: [{ to: OrderStatus.Delivered, roles: RIDER }],
   [OrderStatus.Delivered]: [],
   [OrderStatus.Rejected]: [],
   [OrderStatus.Cancelled]: [],

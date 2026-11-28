@@ -16,9 +16,10 @@ function setup(order: Record<string, unknown>, riders: Record<string, Role> = {}
     },
   };
   const users: any = { findActiveById: async (id: string) => (riders[id] ? { id, role: riders[id] } : null) };
-  const realtime: any = { publishOrderStatusChanged: jest.fn() };
-  const svc = new OrdersService(model, {} as any, {} as any, realtime, users);
-  return { svc, calls, realtime };
+  const realtime: any = { publishOrderStatusChanged: jest.fn(), publishTrackingRevoked: jest.fn() };
+  const tracking: any = { revokeAllForOrder: jest.fn().mockResolvedValue(0) };
+  const svc = new OrdersService(model, {} as any, {} as any, realtime, users, tracking);
+  return { svc, calls, realtime, tracking };
 }
 const base = (status: OrderStatus, extra: Record<string, unknown> = {}) => ({
   status, paymentMethod: 'cod', paymentStatus: PaymentStatus.CodPending, ...extra,

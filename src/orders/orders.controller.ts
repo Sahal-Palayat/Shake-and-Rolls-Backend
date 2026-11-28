@@ -1,5 +1,5 @@
 import { BadRequestException, Body, Controller, Get, Headers, HttpCode, Param, Patch, Post, Query, Res } from '@nestjs/common';
-import { ApiBearerAuth, ApiCreatedResponse, ApiHeader, ApiOkResponse, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiConflictResponse, ApiCreatedResponse, ApiHeader, ApiOkResponse, ApiTags } from '@nestjs/swagger';
 import type { Response } from 'express';
 import { Public } from '../auth/decorators/public.decorator';
 import { Roles } from '../auth/decorators/roles.decorator';
@@ -8,6 +8,8 @@ import { ParseObjectIdPipe } from '../common/parse-object-id.pipe';
 import { CurrentUser } from './current-user.decorator';
 import type { AuthUser } from './current-user.decorator';
 import { CreateOrderDto, ListOrdersQueryDto, OrderDto, OrderQuoteDto, OverrideOrderStatusDto, QuoteOrderDto, UpdateOrderStatusDto } from './dto/order.dto';
+import { ReviewsService } from '../tracking/reviews.service';
+import { ReviewDto, ReviewStateDto, SubmitReviewDto, TrackingErrorDto, TrackingLinkDto, TrackingRevokeResultDto } from '../tracking/dto/tracking.dto';
 import { toOrderDto } from './order.mapper';
 import { OrdersService } from './orders.service';
 
@@ -17,7 +19,10 @@ const KEY_RE = /^[A-Za-z0-9_-]{8,128}$/;
 @ApiBearerAuth()
 @Controller('orders')
 export class OrdersController {
-  constructor(private readonly orders: OrdersService) {}
+  constructor(
+    private readonly orders: OrdersService,
+    private readonly reviews: ReviewsService,
+  ) {}
 
   /** Public on purpose: the cart prices itself before anyone logs in. Reads the menu only, writes nothing. */
   @Public()
@@ -80,5 +85,39 @@ export class OrdersController {
     @Body() dto: OverrideOrderStatusDto,
   ): Promise<OrderDto> {
     return toOrderDto(await this.orders.override(user, id, dto), user.role);
+  }
+
+  // ---------- customer tracking link ----------
+
+  @Roles(Role.Kitchen, Role.Rider, Role.Admin)
+  @Post(':id/tracking-link')
+  @ApiCreatedResponse({ type: TrackingLinkDto, description: 'A new link, valid 24 h. The raw token is only ever in this answer: the server stores a hash. Share it with the customer.' })
+  createTrackingLink(@CurrentUser() user: AuthUser, @Param('id', ParseObjectIdPipe) id: string): Promise<TrackingLinkDto> {
+    return this.orders.createTrackingLink(user, id);
+  }
+
+  @Roles(Role.Kitchen, Role.Admin)
+  @Post(':id/tracking-links/revoke')
+  @HttpCode(200)
+  @ApiOkResponse({ type: TrackingRevokeResultDto, description: 'Security invalidation: every link of this order stops working at once and open tracking pages are closed.' })
+  revokeTrackingLinks(@CurrentUser() user: AuthUser, @Param('id', ParseObjectIdPipe) id: string): Promise<TrackingRevokeResultDto> {
+    return this.orders.revokeTrackingLinks(user, id);
+  }
+
+  // ---------- review (signed-in access; the anonymous route is /reviews/by-token) ----------
+
+  @Roles(Role.Customer, Role.Kitchen, Role.Admin)
+  @Get(':id/review')
+  @ApiOkResponse({ type: ReviewStateDto, description: 'Whether this order can be / has been reviewed (and the review). Same visibility as GET /orders/:id.' })
+  async reviewState(@CurrentUser() user: AuthUser, @Param('id', ParseObjectIdPipe) id: string): Promise<ReviewStateDto> {
+    return this.reviews.stateFor(await this.orders.getVisible(user, id), { viaToken: false });
+  }
+
+  @Roles(Role.Customer)
+  @Post(':id/review')
+  @ApiCreatedResponse({ type: ReviewDto })
+  @ApiConflictResponse({ type: TrackingErrorDto, description: '`not_delivered` or `already_reviewed` (one review per order).' })
+  submitReview(@CurrentUser() user: AuthUser, @Param('id', ParseObjectIdPipe) id: string, @Body() dto: SubmitReviewDto): Promise<ReviewDto> {
+    return this.reviews.submitAsCustomer(user.id, id, dto);
   }
 }

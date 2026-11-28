@@ -8,6 +8,7 @@ import {
   IsIn,
   IsInt,
   IsMongoId,
+  IsNumber,
   IsEnum,
   IsISO8601,
   IsOptional,
@@ -37,10 +38,48 @@ export class OrderLineInputDto {
   optionIds?: string[];
 
   @ApiPropertyOptional({ example: 'Less spicy' }) @IsOptional() @IsString() @MaxLength(200) note?: string;
+
+  @ApiPropertyOptional({ description: 'Combo this line belongs to (GET /combos). Send with comboRef.' })
+  @IsOptional()
+  @IsMongoId()
+  comboId?: string;
+
+  @ApiPropertyOptional({ example: 'c1', description: 'Client label grouping the lines of ONE combo, so two of the same combo stay separate.' })
+  @IsOptional()
+  @Matches(/^[A-Za-z0-9_-]{1,24}$/, { message: 'comboRef must be 1-24 letters, digits, _ or -' })
+  comboRef?: string;
 }
 
+export const LOCATION_SOURCES = ['gps', 'search', 'pin'] as const;
+export type LocationSource = (typeof LOCATION_SOURCES)[number];
+
+const COORD = { allowNaN: false, allowInfinity: false, maxDecimalPlaces: 8 } as const;
+
 export class DeliveryAddressInputDto {
-  @ApiProperty() @IsString() @MinLength(1) @MaxLength(200) line1!: string;
+  @ApiProperty({ example: 11.8745, description: 'PRIMARY delivery location. Checked against the delivery area. The text address is only a label.' })
+  @IsNumber(COORD)
+  @Min(-90)
+  @Max(90)
+  latitude!: number;
+
+  @ApiProperty({ example: 75.3704 })
+  @IsNumber(COORD)
+  @Min(-180)
+  @Max(180)
+  longitude!: number;
+
+  @ApiPropertyOptional({ enum: LOCATION_SOURCES, description: 'How the pin was placed: device GPS, address search, or dragged / tapped on the map.' })
+  @IsOptional()
+  @IsIn(LOCATION_SOURCES as unknown as string[])
+  locationSource?: LocationSource;
+
+  @ApiPropertyOptional({ description: 'Google place id when the customer picked a search result.' }) @IsOptional() @IsString() @MaxLength(300) placeId?: string;
+  @ApiPropertyOptional({ description: 'Address Google returned for the pinned point (reverse geocode / search result).' }) @IsOptional() @IsString() @MaxLength(400) formattedAddress?: string;
+
+  @ApiProperty({ description: 'Address text the customer confirmed (street / locality).' }) @IsString() @MinLength(1) @MaxLength(200) line1!: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(80) houseName?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(80) buildingName?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(30) floor?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(100) area?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() @MaxLength(150) landmark?: string;
   @ApiPropertyOptional({ example: '670001' }) @IsOptional() @Matches(/^\d{6}$/, { message: 'pincode must be 6 digits' }) pincode?: string;
@@ -116,7 +155,7 @@ export class ListOrdersQueryDto {
   @IsOptional()
   @Transform(toList)
   @IsArray()
-  @ArrayMaxSize(9)
+  @ArrayMaxSize(12)
   @IsEnum(OrderStatus, { each: true })
   statuses?: OrderStatus[];
 
@@ -151,7 +190,7 @@ export class OverrideOrderStatusDto {
   @MaxLength(200)
   reason!: string;
 
-  @ApiPropertyOptional({ description: 'Required for assigned / picked_up / delivered when the order has no rider yet.' })
+  @ApiPropertyOptional({ description: 'Required for assigned / rider_accepted / picked_up / out_for_delivery / delivered when the order has no rider yet.' })
   @IsOptional()
   @IsMongoId()
   riderId?: string;
@@ -175,6 +214,18 @@ export class OrderLineDto {
   @ApiProperty() quantity!: number;
   @ApiProperty({ description: '(base + options) x quantity, paise' }) lineTotalPaise!: number;
   @ApiPropertyOptional() note?: string;
+  @ApiPropertyOptional({ description: 'Set when the line is part of a combo.' }) comboRef?: string;
+  @ApiPropertyOptional() comboName?: string;
+}
+
+export class AppliedComboDto {
+  @ApiProperty() comboId!: string;
+  @ApiProperty() comboRef!: string;
+  @ApiProperty() name!: string;
+  @ApiProperty() discountPercent!: number;
+  @ApiProperty({ description: 'How many of this combo' }) quantity!: number;
+  @ApiProperty({ description: 'Line totals of the combo items before savings, paise' }) itemsPaise!: number;
+  @ApiProperty({ description: 'Paise taken off' }) savingsPaise!: number;
 }
 
 export class StatusLogEntryDto {
@@ -187,6 +238,14 @@ export class StatusLogEntryDto {
 }
 
 export class DeliveryAddressDto {
+  @ApiPropertyOptional({ description: 'Absent on orders placed before map pinning existed.' }) latitude?: number;
+  @ApiPropertyOptional() longitude?: number;
+  @ApiPropertyOptional({ enum: LOCATION_SOURCES }) locationSource?: LocationSource;
+  @ApiPropertyOptional() placeId?: string;
+  @ApiPropertyOptional() formattedAddress?: string;
+  @ApiPropertyOptional() houseName?: string;
+  @ApiPropertyOptional() buildingName?: string;
+  @ApiPropertyOptional() floor?: string;
   @ApiProperty() line1!: string;
   @ApiPropertyOptional() area?: string;
   @ApiPropertyOptional() landmark?: string;
@@ -201,7 +260,9 @@ export class OrderDto {
   @ApiProperty({ enum: ['cod'] }) paymentMethod!: 'cod';
   @ApiProperty({ type: [OrderLineDto] }) lines!: OrderLineDto[];
   @ApiProperty({ enum: Fulfillment }) fulfillment!: Fulfillment;
-  @ApiProperty({ description: 'Items only, paise' }) subtotalPaise!: number;
+  @ApiProperty({ description: 'Items after combo savings, paise (= sum of lineTotalPaise - comboSavingsPaise)' }) subtotalPaise!: number;
+  @ApiProperty({ description: 'Paise taken off by combos. 0 = none.' }) comboSavingsPaise!: number;
+  @ApiProperty({ type: [AppliedComboDto] }) combos!: AppliedComboDto[];
   @ApiProperty({ description: 'Paise. 0 for pickup or free delivery' }) deliveryFeePaise!: number;
   @ApiProperty({ description: 'subtotal + delivery fee, paise' }) totalPaise!: number;
   @ApiProperty() contactName!: string;
@@ -219,7 +280,9 @@ export class OrderDto {
 export class OrderQuoteDto {
   @ApiProperty({ type: [OrderLineDto] }) lines!: OrderLineDto[];
   @ApiProperty({ enum: Fulfillment }) fulfillment!: Fulfillment;
-  @ApiProperty({ description: 'Items only, paise' }) subtotalPaise!: number;
+  @ApiProperty({ description: 'Items after combo savings, paise (= sum of lineTotalPaise - comboSavingsPaise)' }) subtotalPaise!: number;
+  @ApiProperty({ description: 'Paise taken off by combos. 0 = none.' }) comboSavingsPaise!: number;
+  @ApiProperty({ type: [AppliedComboDto] }) combos!: AppliedComboDto[];
   @ApiProperty({ description: 'Paise' }) deliveryFeePaise!: number;
   @ApiProperty({ description: 'subtotal + delivery fee, paise' }) totalPaise!: number;
   @ApiProperty({ description: 'Smallest accepted subtotal, paise. 0 = no minimum.' }) minOrderPaise!: number;

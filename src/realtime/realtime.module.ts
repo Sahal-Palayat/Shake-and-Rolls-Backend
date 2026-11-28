@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
 import { MongooseModule } from '@nestjs/mongoose';
 import { Order, OrderSchema } from '../orders/schemas/order.schema';
+import { TrackingModule } from '../tracking/tracking.module';
 import { RealtimeGateway } from './realtime.gateway';
 import { RealtimeService } from './realtime.service';
 import { WsAuthService } from './ws-auth.service';
@@ -10,6 +11,7 @@ import { WsAuthService } from './ws-auth.service';
 @Module({
   imports: [
     MongooseModule.forFeature([{ name: Order.name, schema: OrderSchema }]),
+    TrackingModule, // anonymous tracking sockets are verified by TrackingTokensService
     // ASSUMPTION: same secret env var as REST auth. Swap this block if AuthModule exports its own JwtModule.
     JwtModule.registerAsync({
       inject: [ConfigService],

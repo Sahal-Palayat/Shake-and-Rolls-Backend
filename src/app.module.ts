@@ -4,6 +4,7 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { AdminModule } from './admin/admin.module';
 import { AuthModule } from './auth/auth.module';
 import { validateEnv } from './config/env';
+import { CombosModule } from './combos/combos.module';
 import { MenuModule } from './menu/menu.module';
 import { OrdersModule } from './orders/orders.module';
 import { UploadsModule } from './uploads/uploads.module';
@@ -21,6 +22,7 @@ import {RidersModule} from './riders/riders.module';
     AuthModule,
     AdminModule,
     MenuModule,
+    CombosModule,
     OrdersModule,
     UploadsModule,
     RidersModule,
